@@ -19,11 +19,7 @@ package org.javarosa.xpath.expr;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
+import java.util.*;
 import java.util.regex.Pattern;
 
 import org.javarosa.core.model.condition.EvaluationContext;
@@ -32,13 +28,13 @@ import org.javarosa.core.model.condition.pivot.UnpivotableExpressionException;
 import org.javarosa.core.model.data.GeoPointData;
 import org.javarosa.core.model.data.GeoShapeData;
 import org.javarosa.core.model.data.UncastData;
+import org.javarosa.core.model.instance.AbstractTreeElement;
 import org.javarosa.core.model.instance.FormInstance;
+import org.javarosa.core.model.instance.TreeElement;
 import org.javarosa.core.model.instance.TreeReference;
 import org.javarosa.core.model.utils.DateUtils;
 import org.javarosa.core.services.PropertyManager;
-import org.javarosa.core.util.GeoUtils;
-import org.javarosa.core.util.MathUtils;
-import org.javarosa.core.util.PropertyUtils;
+import org.javarosa.core.util.*;
 import org.javarosa.core.util.externalizable.DeserializationException;
 import org.javarosa.core.util.externalizable.ExtUtil;
 import org.javarosa.core.util.externalizable.ExtWrapListPoly;
@@ -61,6 +57,7 @@ import org.javarosa.xpath.XPathArityException;
  *
  */
 public class XPathFuncExpr extends XPathExpression {
+	protected static final int INVALID_RANK_RESULT = 999;
 	public XPathQName id;			//name of the function
 	public XPathExpression[] args;	//argument list
 
@@ -102,6 +99,7 @@ public class XPathFuncExpr extends XPathExpression {
 				id.toString().equals("random") ||
 				id.toString().equals("once") ||
 				id.toString().equals("now") ||
+				id.toString().equals("index") ||
 				id.toString().equals("today")) {
 				return false;
 			}
@@ -362,6 +360,13 @@ public class XPathFuncExpr extends XPathExpression {
 			assertArgsCount(name, args, 0);
 			//calculated expressions may be recomputed w/o warning! use with caution!!
 			return new Double(MathUtils.getRand().nextDouble());
+		} else if (name.equals("version")) { //non-standard
+			assertArgsCount(name, args, 0);
+			//calculated expressions may be recomputed w/o warning! use with caution!!
+			return model.formVersion == null ? "" : model.formVersion;
+		} else if (name.equals("linebreak")) {
+			assertArgsCount(name, args, 0);
+			return "\n";
 		} else if (name.equals("once")) {
 			assertArgsCount(name, args, 1);
 			XPathPathExpr currentFieldPathExpr = XPathPathExpr.fromRef(evalContext.getContextRef());
@@ -440,6 +445,99 @@ public class XPathFuncExpr extends XPathExpression {
 			}
 
 			return GeoUtils.calculateAreaOfGPSPolygonOnEarthInSquareMeters(gpsCoordinatesList);
+		} else if (name.equals("format-number")) {
+			assertArgsCount(name, args, 1);
+			String value = toString(argVals[0]);
+			return FormatUtils.formatNumber(value);
+		} else if (name.equals("distance-between")) {
+			// SCTO-1324
+			assertArgsCount(name, args, 2);
+
+			String value1 = toString(argVals[0]);
+			String value2 = toString(argVals[1]);
+			if (value1 == null || value2 == null || value1.trim().length() == 0 || value2.trim().length() == 0) {
+				return 0d;
+
+			}
+			GeoPointData geoPointData1;
+			try {
+				geoPointData1 = new GeoPointData().cast(new UncastData(value1));
+			} catch (Exception e) {
+				throw new XPathTypeMismatchException("The function \'" + name + "\' received a value that does not represent GPS coordinates: " + value1);
+			}
+			GeoPointData geoPointData2;
+			try {
+				geoPointData2 = new GeoPointData().cast(new UncastData(value2));
+			} catch (Exception e) {
+				throw new XPathTypeMismatchException("The function \'" + name + "\' received a value that does not represent GPS coordinates: " + value2);
+			}
+			return Distance.calculateDistanceInMeters(new GeoUtils.GPSCoordinates(geoPointData1.getPart(0), geoPointData1.getPart(1)), new GeoUtils.GPSCoordinates(geoPointData2.getPart(0), geoPointData2.getPart(1)));
+		} else if (name.equals("short-geopoint")) {
+			// SCTO-1324
+			assertArgsCount(name, args, 1);
+
+			String value = toString(argVals[0]);
+			if (value == null || value.trim().length() == 0) {
+				return 0d;
+
+			}
+			GeoPointData geoPointData;
+			try {
+				geoPointData = new GeoPointData().cast(new UncastData(value));
+			} catch (Exception e) {
+				throw new XPathTypeMismatchException("Error evaluating function  \'" + name + "()\': " + e.getMessage());
+			}
+			return geoPointData.getPart(0) + " " + geoPointData.getPart(1);
+		} else if (name.equals("de-duplicate")) {
+			// SCTO-1436
+			assertArgsCount(name, args, 2);
+
+			Object separatorObject = unpack(argVals[0]);
+			Object stringObject = unpack(argVals[1]);
+
+			return deDuplicate(name, separatorObject, stringObject);
+		} else if (name.equals("rank-index") || name.equals("rank")) {
+			assertArgsCount(name, args, 2);
+			Object argVal = argVals[1];
+			if (!(argVal instanceof XPathNodeset)) {
+				throw new XPathUnhandledException("function \'" + name + "\' requires a field as the second parameter.");
+			}
+			Object[] argList = ((XPathNodeset) argVal).toArgList();
+			return rankIndex(argVals[0], argList).doubleValue();
+		} else if (name.equals("rank-value")) {
+			assertArgsCount(name, args, 2);
+			return rankValue(toString(argVals[0]), toString(argVals[1])).doubleValue();
+		} else if (name.equals("hash")) {
+			if (args.length == 0) {
+				throw new XPathUnhandledException("function \'" + name + "\' requires at least one argument.");
+			}
+			List<String> valuesToJoin = new ArrayList<String>();
+			for (Object argVal : argVals) {
+				addValueToList(argVal, valuesToJoin);
+			}
+			if (valuesToJoin.isEmpty()) {
+				return "";
+			}
+			String hashResult = "";
+			for (String valueToHash : valuesToJoin) {
+				hashResult += MD5(valueToHash);
+			}
+			return hashResult;
+		} else if (name.equals("index")) {
+			assertArgsCount(name, args, 0);
+
+			TreeReference contextRef = evalContext.getContextRef();
+			TreeElement treeElement = model.resolveReference(contextRef);
+			if (treeElement == null) {
+				// this means that it may be a group not created yet
+				// SCTO-5512: Return the index that it will have
+				return (double)contextRef.getMultLast() + 1d;
+			}
+			AbstractTreeElement<TreeElement> firstRepeatableParent = findFirstRepeatableParent(treeElement);
+			if (firstRepeatableParent == null) {
+				return 0d;
+			}
+			return position(firstRepeatableParent.getRef());
 		} else {
 			//check for custom handler
 			IFunctionHandler handler = funcHandlers.get(name);
@@ -448,6 +546,35 @@ public class XPathFuncExpr extends XPathExpression {
 			} else {
 				throw new XPathUnhandledException("function \'" + name + "\'");
 			}
+		}
+	}
+
+	private AbstractTreeElement<TreeElement> findFirstRepeatableParent(TreeElement treeElement) {
+		if (treeElement.isRepeatable()) {
+			return treeElement;
+		}
+		AbstractTreeElement<TreeElement> parent = treeElement.getParent();
+		while (parent != null) {
+			if (parent.isRepeatable()) {
+				return parent;
+			}
+			parent = parent.getParent();
+		}
+		return null;
+	}
+
+	private void addValueToList(Object argVal, List<String> values) {
+		if (argVal == null) {
+			argVal = "";
+		}
+
+		if (argVal instanceof XPathNodeset) {
+			Object[] argList = ((XPathNodeset) argVal).toArgList();
+			for (Object o : argList) {
+				addValueToList(o, values);
+			}
+		} else {
+			values.add(toString(argVal));
 		}
 	}
 
@@ -1229,6 +1356,205 @@ public class XPathFuncExpr extends XPathExpression {
 		return subsetArgList(args, start, 1);
 	}
 
+	protected static Object deDuplicate(String functionName, Object separatorObject, Object stringObject) {
+		if (separatorObject == null) {
+			throw new XPathTypeMismatchException("The first argument in the \'" + functionName + "\' function can not be empty.");
+		}
+
+		if (!(separatorObject instanceof String)) {
+			throw new XPathTypeMismatchException("The first argument in the \'" + functionName + "\' function should be a string.");
+		}
+
+		if (stringObject == null) {
+			return null;
+		}
+
+		if (!(stringObject instanceof String)) {
+			throw new XPathTypeMismatchException("The second argument in the \'" + functionName + "\' function should be a string.");
+		}
+
+		// we now have 2 not-null strings.
+		String separator = toString(separatorObject);
+		String valueToDeduplicate = toString(stringObject);
+
+		if (valueToDeduplicate.length() == 0 || separator.length() == 0) {
+			return valueToDeduplicate;
+		}
+
+		Set<String> values = new LinkedHashSet<String>();
+
+		// SurveyCTO is using Maven and the following artifact is used
+		//
+		//		<dependency>
+		//			<groupId>commons-lang</groupId>
+		//			<artifactId>commons-lang</artifactId>
+		//			<version>2.6</version>
+		//		</dependency>
+		//
+		// But ODK should probably include this in the lib folder: http://central.maven.org/maven2/commons-lang/commons-lang/2.6/commons-lang-2.6.jar
+		//
+		// https://commons.apache.org/proper/commons-lang/javadocs/api-2.6/org/apache/commons/lang/StringUtils.html#splitByWholeSeparator(java.lang.String, java.lang.String)
+		String[] tokens = StringUtils.splitByWholeSeparator(valueToDeduplicate, separator);
+		for (String token : tokens) {
+			// trim the separator around the token
+			while (token.startsWith(separator)) {
+				token = token.substring(1);
+			}
+			while (token.endsWith(separator)) {
+				token = token.substring(0, token.length() - separator.length());
+			}
+
+			if (token.length() > 0) {
+				values.add(token);
+			}
+		}
+
+		StringBuilder sb = new StringBuilder();
+		for (String value : values) {
+			if (sb.length() > 0) {
+				sb.append(separator);
+			}
+			sb.append(value);
+		}
+
+		return sb.toString();
+	}
+
+	// SCTO-2074
+	protected static Integer rankIndex(Object indexObj, Object[] valueObjects) {
+		int arraySize;
+
+		if (indexObj == null || valueObjects == null || (arraySize = valueObjects.length) == 0) {
+			return INVALID_RANK_RESULT;
+		}
+
+		int index;
+
+		// first try to convert index to an integer
+		if (indexObj instanceof Integer) {
+			index = (Integer) indexObj;
+		} else {
+			Double toDouble = toInt(indexObj);
+			if (toDouble.isInfinite() || toDouble.isNaN()) {
+				return INVALID_RANK_RESULT;
+			}
+			index = toDouble.intValue();
+		}
+
+		if (index < 1 || index > arraySize) {
+			return INVALID_RANK_RESULT;
+		}
+
+		// then try to convert the object array to a numeric array.
+		// Any invalid value will be converted to Double.POSITIVE_INFINITY
+		List<Double> values = toDoubleArraySorted(valueObjects);
+
+		Double v = convertToDoubleForRankingPurposes(valueObjects[index - 1]);
+
+		// SCTO-4400: find the index of "v" in the sorted array
+		int fr = Collections.frequency(values, v);
+		if (fr == 1) {
+			// no change, existing behavior
+			return rankOfValue(v, values, index);
+		} else {
+			int newIndex = values.indexOf(v);
+			int previousCount = 0;
+			for (int i = 0; i < index - 1; i++) {
+				Double p = convertToDoubleForRankingPurposes(valueObjects[i]);
+				if (p.equals(v)) {
+					previousCount++;
+				}
+			}
+			return rankOfValue(v, values, newIndex + previousCount);
+		}
+	}
+
+	protected static Integer rankValue(Object valueInArray, String valuesList) {
+		if (valuesList == null || valuesList.trim().length() == 0) {
+			return INVALID_RANK_RESULT;
+		}
+
+		String[] valuesStr = valuesList.split(" ");
+
+		if (valuesStr.length == 0) {
+			return INVALID_RANK_RESULT;
+		}
+
+		List<Double> values = toDoubleArraySorted(valuesStr);
+
+		Double v = convertToDoubleForRankingPurposes(valueInArray);
+
+		int indexOfValue = values.indexOf(v);
+		if (indexOfValue == -1) {
+			return INVALID_RANK_RESULT;
+		}
+
+		// SCTO-4400: fr is at least 1 here
+		int fr = Collections.frequency(values, v);
+
+		return rankOfValue(v, values, indexOfValue + (fr - 1));
+	}
+
+	private static List<Double> toDoubleArraySorted(Object[] valueObjects) {
+		List<Double> values = new ArrayList<Double>(valueObjects.length);
+		for (Object valueObject : valueObjects) {
+			Double dv = convertToDoubleForRankingPurposes(valueObject);
+			values.add(dv);
+		}
+
+		Collections.sort(values, new Comparator<Double>() {
+			@Override
+			public int compare(Double o1, Double o2) {
+				// reverse order
+				return o2.compareTo(o1);
+			}
+		});
+
+		return values;
+	}
+
+	private static int rankOfValue(Double v, List<Double> values, int indexOfValue) {
+		int arraySize = values.size();
+
+		if (v.isInfinite()) {
+			return INVALID_RANK_RESULT;
+		} else {
+			int firstIndex = values.indexOf(v);
+			int lastIndex = values.lastIndexOf(v);
+			int rank = firstIndex + 1;
+			if (firstIndex == lastIndex) {
+				return rank;
+			} else {
+				// we have a tie
+				// we will count (N) how many matches we have after first index and add N to the rank
+				for (int i = indexOfValue + 1; i < arraySize; i++) {
+					Double value = values.get(i);
+					if (value.equals(v)) {
+						rank++;
+					}
+				}
+				return rank;
+			}
+		}
+	}
+
+	private static Double convertToDoubleForRankingPurposes(Object valueObject) {
+		Double dv;
+		if (valueObject == null) {
+			dv = Double.NEGATIVE_INFINITY;
+		} else {
+			if (valueObject instanceof Integer) {
+				dv = ((Integer) valueObject).doubleValue();
+			} else {
+				dv = toNumeric(valueObject);
+			}
+		}
+		if (dv.isInfinite() || dv.isNaN()) {
+			dv = Double.NEGATIVE_INFINITY;
+		}
+		return dv;
+	}
+
 	/**
 	 * return a subset of an argument list as a new arguments list
 	 *
@@ -1522,4 +1848,22 @@ public class XPathFuncExpr extends XPathExpression {
 
 	}
 
+	public static String MD5(String md5) {
+		return MD5(md5.getBytes());
+	}
+
+	public static String MD5(byte[] data) {
+		try {
+			java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+			byte[] array = md.digest(data);
+			StringBuilder sb = new StringBuilder();
+			for (int i = 0; i < array.length; ++i) {
+				sb.append(Integer.toHexString((array[i] & 0xFF) | 0x100).substring(1,3));
+			}
+			return sb.toString();
+		} catch (java.security.NoSuchAlgorithmException e) {
+			e.printStackTrace();
+			return null;
+		}
+	}
 }
